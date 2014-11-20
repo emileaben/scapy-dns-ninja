@@ -46,6 +46,24 @@ dest_idx = 0
 dests = read_destfile('ips.txt')
 dests_len = len( dests )
 
+def generate_A_response( pkt, dest_ip ):
+   resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
+      /UDP(dport=pkt[UDP].sport, sport=53)\
+      /DNS( id=pkt[DNS].id,
+            aa=1, #we are authoritative
+            qr=1, #it's a response
+            rd=pkt[DNS].rd, # copy recursion-desired
+            qdcount=pkt[DNS].qdcount, # copy question-count
+            qd=pkt[DNS].qd, # copy question itself
+            ancount=1, #we provide a single answer
+            an=DNSRR(rrname=pkt[DNS].qd.qname, ttl=1 ,rdata=dest_ip ),
+      )
+
+   ## hack to do 'edns0': just return the additional section we got :/
+   if pkt[DNS].arcount > 0:
+      resp[DNS].arcount = pkt[DNS].arcount
+      resp[DNS].ar = pkt[DNS].ar
+   return resp
 
 def DNS_Responder(localIP):
     def getResponse(pkt):
@@ -55,24 +73,15 @@ def DNS_Responder(localIP):
             print pkt[DNS].qd
             if ( pkt[DNS].qd.qtype == 1 ): ###  1 = 'A'
                 dest_ip = conf['ServerIP']
-                if ( pkt[DNS].qd.qname.lower() != conf['ServerName'] ):
+                #if pkt[DNS].qd.qname.lower() != conf['ServerName']:
+                if not conf['ServerName'] in pkt['DNS Question Record'].qname:
                     dest_ip = dests[dest_idx]
                     dest_idx += 1
                     if dest_idx >= dests_len: dest_idx = 0
+                else:
+                    print "lower: %s" % ( pkt[DNS].qd.qname.lower() )
                 try:
-                    resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
-                        /UDP(dport=pkt[UDP].sport, sport=53)\
-                        /DNS( id=pkt[DNS].id,
-                              aa=1, #we are authoritative
-                              qr=1, #it's a response
-                              rd=pkt[DNS].rd, # copy recursion-desired
-                              qdcount=pkt[DNS].qdcount, # copy question-count
-                              qd=pkt[DNS].qd, # copy question itself
-                              ancount=1, #we provide a single answer
-                              an=DNSRR(rrname=pkt[DNS].qd.qname, ttl=1 ,rdata=dest_ip ),
-                              #nscount=1, #we provide a single auth record
-                              #ns=DNSRR(rrname=conf['ServerDomain'], ttl=86400, type='NS', rdata=conf['ServerName'] )
-                        )
+                    resp = generate_A_response( pkt, dest_ip )
                     send(resp,verbose=0)
                     return "sent resp for %s" % ( dest_ip )
                 except:

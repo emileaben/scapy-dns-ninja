@@ -54,29 +54,30 @@ def DNS_Responder(localIP):
         if (DNS in pkt and pkt[DNS].opcode == 0L and pkt[DNS].ancount == 0 and pkt[IP].src != localIP):
             print pkt[DNS].qd
             if ( pkt[DNS].qd.qtype == 1 ): ###  1 = 'A'
-                    try:
-                        dest_ip = dests[dest_idx]
-                        resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
-                            /UDP(dport=pkt[UDP].sport, sport=53)\
-                            /DNS( id=pkt[DNS].id,
-                                  aa=1, #we are authoritative
-                                  qr=1, #it's a response
-                                  rd=pkt[DNS].rd, # copy recursion-desired
-                                  qdcount=pkt[DNS].qdcount, # copy question-count
-                                  qd=pkt[DNS].qd, # copy question itself
-                                  ancount=1, #we provide a single answer
-                                  an=DNSRR(rrname=pkt[DNS].qd.qname, ttl=1 ,rdata=dest_ip ),
-                                  nscount=1, #we provide a single auth record
-                                  ns=DNSRR(rrname=conf['ServerDomain'], ttl=86400, type='NS', rdata=conf['ServerName'] )
-                            )
-                            #/DNSRR(rrname="random-ipv4.ox.sg.ripe.net",rdata=dest_ip))
-                        send(resp,verbose=0)
-                        dest_idx += 1
-                        if dest_idx >= dests_len: dest_idx = 0
-                        return "sent resp for %s" % ( dest_ip )
-                    except:
-                        print "error on packet: %s" % ( pkt.summary() )
-                        print sys.exc_info()
+                dest_ip = conf['ServerIP']
+                if ( pkt[DNS].qd.qname.lower() != conf['ServerName'] ):
+                    dest_ip = dests[dest_idx]
+                    dest_idx += 1
+                    if dest_idx >= dests_len: dest_idx = 0
+                try:
+                    resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
+                        /UDP(dport=pkt[UDP].sport, sport=53)\
+                        /DNS( id=pkt[DNS].id,
+                              aa=1, #we are authoritative
+                              qr=1, #it's a response
+                              rd=pkt[DNS].rd, # copy recursion-desired
+                              qdcount=pkt[DNS].qdcount, # copy question-count
+                              qd=pkt[DNS].qd, # copy question itself
+                              ancount=1, #we provide a single answer
+                              an=DNSRR(rrname=pkt[DNS].qd.qname, ttl=1 ,rdata=dest_ip ),
+                              #nscount=1, #we provide a single auth record
+                              #ns=DNSRR(rrname=conf['ServerDomain'], ttl=86400, type='NS', rdata=conf['ServerName'] )
+                        )
+                    send(resp,verbose=0)
+                    return "sent resp for %s" % ( dest_ip )
+                except:
+                     print "error on packet: %s" % ( pkt.summary() )
+                     print sys.exc_info()
             elif ( pkt[DNS].qd.qtype == 2 ): ###  2 = 'NS'
                 # regardless of the question we only know one answer
                 print "we got an NS request, exiting!"

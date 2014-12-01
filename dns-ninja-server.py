@@ -3,7 +3,10 @@
 from scapy.all import *
 import sys
 from random import shuffle
+import re
 import yaml
+import traceback
+import os.path
 
 def read_conffile( filename ):
    conf = {}
@@ -15,36 +18,27 @@ def read_conffile( filename ):
    return conf
 
 conf = read_conffile('ninja-server.conf')
+lists = {}
 
-class DNSSOARecord(Packet):
-   # http://tools.ietf.org/html/rfc1035#section-3.3.13
-   name = "DNSSOA"
-   fields_desc = [ 
-      DNSStrField("mname", None),
-      DNSStrField("rname", None),
-      IntField("serial", 1),
-      IntField("refresh", 3600), 
-      IntField("retry", 600),
-      IntField("expire", 864000),
-      IntField("minimum", 300)
-   ]
-   def h2i(self, pkt, x):
-      return str(x)
-   def i2m(self, pkt, x):
-      return str(x)
-
-def read_destfile( filename ):
+def read_destfile( list_name, lists ):
+    filename = "./%s/ips.txt" % ( list_name )
     dests = []
     with open(filename,'r') as fh:
         for line in fh:
             line = line.rstrip('\n')
             dests.append( line ) 
     shuffle( dests )
-    return dests
+    lists[ list_name ] = { 
+        'dests': dests,
+        'mtime': os.path.getmtime( filename ),
+        'length': len(dests),
+        'dest_idx': 0
+    }
+    print >>sys.stderr, "list %s successfully loaded" % ( list_name )
+    return lists
 
-dest_idx = 0
-dests = read_destfile('ips.txt')
-dests_len = len( dests )
+## read the default list
+read_destfile('_default',lists)
 
 def generate_A_response( pkt, dest_ip ):
    resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
@@ -58,76 +52,48 @@ def generate_A_response( pkt, dest_ip ):
             ancount=1, #we provide a single answer
             an=DNSRR(rrname=pkt[DNS].qd.qname, ttl=1 ,rdata=dest_ip ),
       )
-
-   ## hack to do 'edns0': just return the additional section we got :/
-   if pkt[DNS].arcount > 0:
-      resp[DNS].arcount = pkt[DNS].arcount
-      resp[DNS].ar = pkt[DNS].ar
    return resp
 
-def DNS_Responder(localIP):
+def DNS_Responder(conf,lists):
+    #TODO better regex
+    re_getlist = re.compile(r'([a-z0-9\-]+)\.%s\.$' % ( conf['ServerDomain'] ) )
     def getResponse(pkt):
         print "RECEIVED: %s" % ( pkt.summary() )
         global dest_idx
-        if (DNS in pkt and pkt[DNS].opcode == 0L and pkt[DNS].ancount == 0 and pkt[IP].src != localIP):
-            print pkt[DNS].qd
+        if (DNS in pkt and pkt[DNS].opcode == 0L and pkt[DNS].ancount == 0 and pkt[IP].src != conf['ServerIP']):
             try:
-                    if ( pkt[DNS].qd.qtype == 1 ): ###  1 = 'A'
-                        dest_ip = conf['ServerIP']
-                        #if pkt[DNS].qd.qname.lower() != conf['ServerName']:
-                        if not conf['ServerName'] in pkt['DNS Question Record'].qname:
-                            dest_ip = dests[dest_idx]
-                            dest_idx += 1
-                            if dest_idx >= dests_len: dest_idx = 0
-                        else:
-                            print "lower: %s" % ( pkt[DNS].qd.qname.lower() )
-                        try:
-                            resp = generate_A_response( pkt, dest_ip )
-                            send(resp,verbose=0)
-                            return "sent resp for %s" % ( dest_ip )
-                        except:
-                             print "error on packet: %s" % ( pkt.summary() )
-                             print sys.exc_info()
-                    elif ( pkt[DNS].qd.qtype == 2 ): ###  2 = 'NS'
-                        # regardless of the question we only know one answer
-                        print "we got an NS request, exiting!"
-                        resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
-                               /UDP(dport=pkt[UDP].sport, sport=53)\
-                               /DNS( id=pkt[DNS].id,
-                                          aa=1, #we are authoritative
-                                          qr=1, #it's a response
-                                          rd=pkt[DNS].rd, # copy recursion-desired
-                                          qdcount=pkt[DNS].qdcount, # copy question-count
-                                          qd=pkt[DNS].qd, # copy question itself
-                                          ancount=1, #we provide a single answer
-                                          an=DNSRR(rrname=conf['ServerDomain'], ttl=86400, type='NS', rdata=conf['ServerName'] )
-                               )
-                        send(resp,verbose=0)
-                    elif ( pkt[DNS].qd.qtype == 6 ): ###  6 = 'SOA'
-                        print "we got a SOA request, exiting!"
-                        soa = DNSSOARecord( mname=conf['ServerName'], rname="root.%s" % ( conf['ServerName'] ) ) 
-                        resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
-                               /UDP(dport=pkt[UDP].sport, sport=53)\
-                               /DNS( id=pkt[DNS].id,
-                                          aa=1, #we are authoritative
-                                          qr=1, #it's a response
-                                          rd=pkt[DNS].rd, # copy recursion-desired
-                                          qdcount=pkt[DNS].qdcount, # copy question-count
-                                          qd=pkt[DNS].qd, # copy question itself
-                                          ancount=1, #we provide a single answer
-                                          an=DNSRR(
-                                               rrname=conf['ServerDomain'],
-                                               ttl=86400,
-                                               type=6,
-                                               rdata=str(soa)
-                                          )
-                               )
-                        send(resp,verbose=0)
-                    else:
-                        print "we got a not A/NS/SOA request, exiting!"
+               if ( pkt[DNS].qd.qtype in [1,28] ): ###  A or AAAA
+                  # sensible default
+                  list_name = '_default'
+                  list_match = re.search( re_getlist, pkt[DNS].qd.qname.lower() )
+                  if list_match and os.path.exists( "./%s/ips.txt" % ( list_match.group(1) ) ):
+                      list_name = list_match.group(1)
+                      if list_name not in lists or os.path.getmtime("./%s/ips.txt" % (list_name) ) > lists[list_name]['mtime']:
+                         ## read if the list wasn't read yet or if the mtime changed
+                         read_destfile( list_name, lists )
+                  try:
+                      dest_idx = lists[list_name]['dest_idx']
+                      dest_ip = lists[list_name]['dests'][dest_idx]
+                      if lists[list_name]['dest_idx'] < lists[list_name]['length']-1:
+                          lists[list_name]['dest_idx'] += 1
+                      else:
+                          print "list reset %s" % ( list_name )
+                          #TODO shuffle? configurable?
+                          shuffle( lists[list_name]['dests'] )
+                          lists[list_name]['dest_idx'] = 0 ## reset to beginning
+                      resp = generate_A_response( pkt, dest_ip )
+                      send(resp,verbose=0)
+                      return "sent resp for %s" % ( dest_ip )
+                  except:
+                       print "error on packet: %s" % ( pkt.summary() )
+                       print sys.exc_info()
+               else:
+                  print "query type not supported"
             except:
-                print "no qd.qtype in this dns request?!"
+                print "%s" % ( traceback.print_tb( sys.exc_info()[2] ) )
+        else: 
+            print "no qd.qtype in this dns request?!"
     return getResponse
 
 filter = "udp port 53 and ip dst %s and not ip src %s" % (conf['ServerIP'], conf['ServerIP'])
-sniff(filter=filter,prn=DNS_Responder(conf['ServerIP']))
+sniff(filter=filter,store=0,prn=DNS_Responder(conf,lists))

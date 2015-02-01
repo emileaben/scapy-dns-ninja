@@ -7,6 +7,7 @@ import re
 import yaml
 import traceback
 import os.path
+import struct
 
 def read_conffile( filename ):
    conf = {}
@@ -18,7 +19,7 @@ def read_conffile( filename ):
    return conf
 
 conf = read_conffile('ninja-server.conf')
-lists = {'v4':{},'v6':{}}
+lists = {'v4':{},'v6':{}, 'cnames':{}}
 
 def read_destfile( list_name, lists, proto ):
     filename = "./%s/dests.%s.txt" % ( list_name, proto )
@@ -55,7 +56,12 @@ if not lists_read > 0:
    print >>sys.stderr,"need at least a default IPv4 or default IPv6 list"
    sys.exit(0)
 
-def generate_A_response( pkt, dest_ip ):
+def generate_response( pkt, dest, proto ):
+   ptype='A'
+   if proto=='v6':
+      ptype='AAAA'
+   elif proto=='cnames':
+      ptype='CNAME'
    resp = IP(dst=pkt[IP].src, id=pkt[IP].id)\
       /UDP(dport=pkt[UDP].sport, sport=53)\
       /DNS( id=pkt[DNS].id,
@@ -65,19 +71,25 @@ def generate_A_response( pkt, dest_ip ):
             qdcount=pkt[DNS].qdcount, # copy question-count
             qd=pkt[DNS].qd, # copy question itself
             ancount=1, #we provide a single answer
-            an=DNSRR(rrname=pkt[DNS].qd.qname, ttl=1 ,rdata=dest_ip ),
+            an=DNSRR(rrname=pkt[DNS].qd.qname, type=ptype, ttl=1, rdata=dest ),
       )
    return resp
 
 def record( src, list_name, proto, dest_ip ):
    ''' write we sent this pkt somewhere '''
-   print "src=%s list=%s proto=%s dest=%s" % ( src, list_name, proto, dest_ip )
+   return "src=%s list=%s proto=%s dest=%s" % ( src, list_name, proto, dest_ip )
+
+def have_listfile( list_name, proto ):
+   filename="./%s/dests.%s.txt" % ( list_name, proto )
+   if os.path.exists( filename ):
+      return True
+   else:
+      return False
 
 def DNS_Responder(conf,lists):
     #TODO better regex
     re_getlist = re.compile(r'([a-z0-9\-]+)\.%s\.$' % ( conf['ServerDomain'] ) )
     def getResponse(pkt):
-        print >>sys.stderr,"RECEIVED: %s" % ( pkt.summary() )
         global dest_idx
         if (DNS in pkt and pkt[DNS].opcode == 0L and pkt[DNS].ancount == 0 and pkt[IP].src != conf['ServerIP']):
             try:
@@ -91,11 +103,28 @@ def DNS_Responder(conf,lists):
                # sensible default
                list_name = '_default'
                list_match = re.search( re_getlist, pkt[DNS].qd.qname.lower() )
-               if list_match and os.path.exists( "./%s/dests.%s.txt" % ( list_match.group(1), pkt_proto ) ):
+               if list_match and os.path.exists( "./%s" % ( list_match.group(1) ) ):
+                   #this checks if the path exists
                    list_name = list_match.group(1)
-                   if list_name not in lists[pkt_proto] or os.path.getmtime("./%s/dests.%s.txt" % (list_name, pkt_proto) ) > lists[pkt_proto][list_name]['mtime']:
+                   if have_listfile( list_name, pkt_proto ) and ( list_name not in lists[pkt_proto] or os.path.getmtime("./%s/dests.%s.txt" % (list_name, pkt_proto) ) > lists[pkt_proto][list_name]['mtime'] ):
                       ## read if the list wasn't read yet or if the mtime changed
-                      read_destfile( list_name, lists )
+                      try:
+                          read_destfile( list_name, lists, pkt_proto )
+                      except: 
+                          # list dir does exist, but not for the right proto. return nothing
+                          print >>sys.stderr,"%s dir exists, but no dests.%s.txt file" % ( list_name, pkt_proto )
+                          return
+                   ##if not dests.v[46].txt , see if there is a dests.cnames.txt file
+                   elif have_listfile( list_name, 'cnames') and ( list_name not in lists['cnames'] or os.path.getmtime("./%s/dests.cnames.txt" % (list_name) ) > lists['cnames'][list_name]['mtime']):
+                      try:
+                          read_destfile( list_name, lists, 'cnames' )
+                      except: 
+                          # list dir does exist, but not for the right proto. return nothing
+                          print >>sys.stderr,"%s dir exists, but no dests.%s.txt file" % ( list_name, 'cnames' )
+                          return
+               ## set pkt_proto to 'cnames' if v4 and v6 list don't exist
+               if list_name in lists['cnames'] and not list_name in lists['v4'] and not list_name in lists['v6']:
+                  pkt_proto = 'cnames'
                try:
                    dest_idx = lists[pkt_proto][list_name]['dest_idx']
                    dest_ip = lists[pkt_proto][list_name]['dests'][dest_idx]
@@ -106,10 +135,9 @@ def DNS_Responder(conf,lists):
                        #TODO shuffle? configurable?
                        shuffle( lists[pkt_proto][list_name]['dests'] )
                        lists[pkt_proto][list_name]['dest_idx'] = 0 ## reset to beginning
-                   resp = generate_A_response( pkt, dest_ip )
+                   resp = generate_response( pkt, dest_ip, pkt_proto )
                    send(resp,verbose=0)
-                   record( pkt[IP].src, list_name, pkt_proto, dest_ip )
-                   return "sent resp for %s" % ( dest_ip )
+                   return record( pkt[IP].src, list_name, pkt_proto, dest_ip )
                except:
                     print >>sys.stderr,"error on packet: %s" % ( pkt.summary() )
                     print >>sys.stderr,sys.exc_info()
